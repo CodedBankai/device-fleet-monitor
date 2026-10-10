@@ -128,3 +128,106 @@ pytest -v
 ```
 
 The tests use a fake clock, so they finish in well under a second and never wait in real time.
+
+## Example API requests
+
+The examples use `curl` (macOS, Linux, or Git Bash on Windows). You can also run all of them from http://127.0.0.1:8000/docs.
+
+**Register a device** (`201 Created`)
+
+```bash
+curl -X POST http://127.0.0.1:8000/devices \
+  -H "Content-Type: application/json" \
+  -d '{"id": "device-01", "name": "Lab Device 01"}'
+```
+
+```json
+{
+  "id": "device-01",
+  "name": "Lab Device 01",
+  "status": "OFFLINE",
+  "last_heartbeat": null,
+  "registered_at": "2026-10-10T10:00:00Z",
+  "last_event_timestamp": null,
+  "payload_status": null,
+  "metrics": {}
+}
+```
+
+**Send a heartbeat** (`200 OK`)
+
+```bash
+curl -X POST http://127.0.0.1:8000/devices/device-01/heartbeat \
+  -H "Content-Type: application/json" \
+  -d '{"timestamp": "2026-10-10T10:00:05Z", "status": "OK", "cpu_usage": 42, "signal_strength": -71}'
+```
+
+```json
+{ "device_id": "device-01", "status": "ONLINE", "payload_applied": true }
+```
+
+**List devices, get one device, get the summary**
+
+```bash
+curl http://127.0.0.1:8000/devices
+curl http://127.0.0.1:8000/devices/device-01
+curl http://127.0.0.1:8000/summary
+```
+
+```json
+{ "total": 1, "online": 1, "offline": 0 }
+```
+
+**Error responses**
+
+| Situation | Response |
+|---|---|
+| Registering an ID that already exists | `409 Conflict` |
+| Heartbeat or lookup for an unknown device | `404 Not Found` |
+| Request body is not valid JSON | `400 Bad Request` |
+| Valid JSON but missing/invalid fields (blank id, bad timestamp, missing status) | `422 Unprocessable Entity` |
+
+Windows PowerShell users: use the `/docs` page, or `Invoke-RestMethod`, since PowerShell handles quotes in `curl` differently.
+
+## Edge case handling
+
+| Edge case | Behaviour |
+|---|---|
+| Device never sent a heartbeat | OFFLINE, `last_heartbeat` is `null` |
+| Heartbeat exactly 30 s ago | ONLINE (the limit is inclusive); 30.001 s is OFFLINE |
+| Heartbeat with `"status": "ERROR"` | Device stays ONLINE; `payload_status` shows `ERROR` |
+| Device clock is wrong (e.g. a year behind) | No effect on ONLINE/OFFLINE, which uses server receipt time |
+| Heartbeat arrives out of order (older device timestamp) | Payload and metrics are not overwritten (`payload_applied: false`), but the device is still marked as seen |
+| Timestamp without a timezone | Assumed to be UTC |
+| Summary consistency | Every device is evaluated against one shared `now`, so `total == online + offline` |
+| Re-registering an existing ID | `409`; the original device is left unchanged |
+| Simulator cannot reach the server | Logs a warning and retries every interval; requests time out after 3 s so threads never hang |
+| Server restarts and forgets devices | Simulator gets a `404`, re-registers, and carries on |
+
+## Assumptions
+
+- Duplicate registration is rejected with `409` (rather than silently updating), so one client cannot overwrite another's device by accident.
+- Device IDs are case-sensitive; IDs and names are trimmed of surrounding spaces, and IDs are at most 64 characters.
+- The 30-second timeout is measured from the server's receipt time, with the 30.0 s boundary counted as ONLINE.
+- Heartbeat `status` is free text (`OK`, `ERROR`, ...); the service does not restrict its values.
+- `cpu_usage` must be between 0 and 100 when provided.
+- All times are handled and returned in UTC.
+
+## Known limitations
+
+- **No persistence.** Data lives in memory and is lost when the server restarts.
+- **Single process only.** The lock protects threads within one process. Running several uvicorn workers would give each its own separate data.
+- **No authentication.** Anyone who can reach the API can register devices or send heartbeats.
+- **Future timestamps.** A device that sends a timestamp far in the future would cause its later (correct) payloads to be treated as stale. Connectivity status is unaffected.
+- **No device deletion or update endpoint**, and no pagination of `GET /devices`.
+- **The simulator is verified manually**, not by automated tests.
+
+## What I would improve with one more day
+
+1. Persist devices and heartbeats in SQLite so data survives restarts and several workers can share it.
+2. Reject or clamp timestamps that are far in the future.
+3. Add `GET /devices?status=ONLINE|OFFLINE` filtering, pagination, and a delete endpoint.
+4. Add API-key authentication for the heartbeat endpoint.
+5. Add structured (JSON) logging and a Dockerfile.
+6. Add a concurrency test (many threads sending heartbeats at once) and automated tests for the simulator.
+7. Set up GitHub Actions to run the tests on every push.
